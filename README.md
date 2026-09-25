@@ -72,3 +72,63 @@ flowchart TD
 ```
 
 The core difference between a bare agent and a ReAct agent is that the ReAct agent can reason about its observations and decide whether to take an action or provide a final answer. This allows for more complex interactions and decision-making processes.
+
+### 03 ReAct Agent with Error Handling
+
+[03-react-agent-with-error-handling](03-react-agent-with-error-handling/) adds error handling to the ReAct agent. It is the same three-tool loop as 02; what changes is that every failure now has a route, decided by who can actually fix it — the model, the code, or nobody.
+
+Here's the structure of an error-handling ReAct agent:
+
+```mermaid
+flowchart TD
+    U["User Task"] --> LLM["LLM"]
+
+    LLM -- "BadRequest · connection · 5xx" --> AE["Return the error message<br/>no retry — the SDK already did"]
+    LLM --> R["Reason"]
+    R --> A["Action"]
+
+    A --> P{"Usable call?"}
+
+    P -- "Bad JSON · past the per-round cap" --> E["Error: ... observation"]
+    P -- "Yes" --> T["Execute Tool"]
+
+    T --> C{"Failure class"}
+    C -- "Deterministic<br/>FileNotFound · unknown tool · bad args" --> E
+    C -- "Transient<br/>timeout · connection" --> RB["Retry with backoff"]
+    RB --> T
+    RB -. "exhausted" .-> E
+    C -- "None" --> O["Observation"]
+
+    E --> CL["Clip to MAX_OBS_CHARS"]
+    O --> CL
+    CL --> M["Append to history"]
+    M --> LLM
+
+    LLM --> F{"Final Answer?"}
+    F -- "Yes" --> FA["Final Answer"]
+    F -- "No / Tool Call" --> R
+```
+
+In pseudocode, the error-handling ReAct agent can be represented as follows:
+
+```python
+while not finished:
+
+    try:
+        response = llm(messages)
+    except BadRequestError as e:              # our request is invalid — retrying cannot help
+        return f"Error: {e}"
+
+    if response.tool_call:
+        args, error = parse(response.tool_call)   # syntax and type, one choke point
+        if error:
+            observation = error                   # deterministic — the model can fix this
+        else:
+            observation = call_tool(args)         # retries transient failures inside;
+                                                  # returns "Error: ..." for the rest
+        messages.append(clip(observation))        # bounded before it enters the history
+    else:
+        return response
+```
+
+The core difference between the 02 ReAct agent and the error-handling one is not that it fails less often, but that every failure is routed to whoever can fix it. Deterministic failures go straight back to the model as an observation, transient ones are absorbed by the code with bounded backoff, and a request the API rejects ends the run instead of being retried — so the agent turns failures into feedback instead of stopping on them.
