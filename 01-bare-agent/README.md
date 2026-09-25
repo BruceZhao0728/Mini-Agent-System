@@ -94,7 +94,7 @@ The program exits immediately if the key is still the placeholder.
 
 ## Running
 
-Run from this directory — `logs/` and `tmp/` are relative paths:
+Run from this directory:
 
 ```bash
 cd 01-bare-agent
@@ -179,6 +179,4 @@ main.py      entry point: argv parsing, key check, calls Agent().run()
 agent.py     the agent loop
 tools.py     tool implementations + the two registration structures
 config.py    credentials, model, and logging switches
-logs/        generated run log (scratch)
-tmp/         scratch output from tool calls
 ```
