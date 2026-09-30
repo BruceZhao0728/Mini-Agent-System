@@ -132,3 +132,52 @@ while not finished:
 ```
 
 The core difference between the 02 ReAct agent and the error-handling one is not that it fails less often, but that every failure is routed to whoever can fix it. Deterministic failures go straight back to the model as an observation, transient ones are absorbed by the code with bounded backoff, and a request the API rejects ends the run instead of being retried — so the agent turns failures into feedback instead of stopping on them.
+
+### 04 ReAct Agent with More Tools
+
+[04-react-agent-with-more-tools](04-react-agent-with-more-tools/) grows the toolkit from three tools to twelve. The agent itself is untouched — `react_agent.py`, `config.py` and `utils.py` are byte-for-byte identical to 03's, and the only change outside the tools layer is six lines in `main.py`. What changes is how tools are declared: `tools.py` becomes a `tools/` package in which each plugin carries its own schema next to the function, a single `@tool` decorator is the whole registration, a loader discovers and imports the plugins, and a set of load-time checks turns the mistakes that would otherwise surface only as "this tool is a bit flaky" into a refusal to start.
+
+Here's the structure of a plugin-loaded ReAct agent:
+
+```mermaid
+flowchart TD
+    U["User Task"] --> RA["ReActAgent<br/>loop unchanged from 03"]
+
+    RA -- "imports TOOLS / TOOLS_DESC" --> L["tools/__init__.py<br/>discover · import · validate"]
+
+    L -- "author error<br/>missing import · duplicate name<br/>required not in parameters · deco without return" --> X["RuntimeError<br/>the agent refuses to start"]
+    L -- "plugin will not import" --> FL["FAILED<br/>those tools do not exist, the agent still runs"]
+
+    L --> P1["local.py<br/>read_file · write_file<br/>execute_command · list_directory"]
+    L --> P2["network.py<br/>search_web · fetch_webpage<br/>get_news · download_file"]
+    L --> P3["runtime.py<br/>run_python"]
+    L --> P4["vcs.py<br/>git_status · git_diff · git_log"]
+
+    P1 -.-> S["_spec.py — the @tool decorator<br/>_common.py — helpers shared by several plugins"]
+    P2 -.-> S
+    P3 -.-> S
+    P4 -.-> S
+
+    RA -- "dispatch through TOOLS" --> EX["Execute the named tool"]
+    EX --> O["Observation, clipped to MAX_OBS_CHARS"]
+    O --> RA
+```
+
+In pseudocode, the loader can be represented as follows:
+
+```python
+for name in sorted(plugins):                 # every tools/*.py; "_" means shared code, not a plugin
+    try:
+        import_module(name)                  # runs each @tool decorator, filling one registry
+    except Exception as e:
+        FAILED[name] = e                     # environment problem — degrade, but record
+
+check_undefined_names()                      # author errors — raise, so the agent refuses to start
+check_duplicate_names()
+check_declarations()
+
+TOOLS      = {t.name: t.fn for t in registry()}   # dispatch
+TOOLS_DESC = [schema(t)    for t in registry()]   # what the model sees
+```
+
+The core difference between the 03 and 04 agents is not in the agent at all: the loop, the error routing and the budgets are identical, and only the tools layer changed. 03 asked who can fix a failure at runtime; 04 asks the same question one step earlier. A plugin whose function body references a name that does not exist is deterministic and fixable by editing the file, so the agent refuses to start; a plugin that cannot be imported is an environment problem, so it degrades, is recorded in `FAILED`, and is printed by `main.py`. The payoff is a toolkit that can grow from three tools to twelve — and keep growing — without `react_agent.py` knowing that anything happened.
