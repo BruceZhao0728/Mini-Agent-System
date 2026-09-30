@@ -1,3 +1,6 @@
 # Claude Code related files
-*.claude
+.claude/
 CLAUDE.md
+
+# VSCode related files
+.vscode/
