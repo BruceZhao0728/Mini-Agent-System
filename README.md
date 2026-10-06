@@ -181,3 +181,71 @@ TOOLS_DESC = [schema(t)    for t in registry()]   # what the model sees
 ```
 
 The core difference between the 03 and 04 agents is not in the agent at all: the loop, the error routing and the budgets are identical, and only the tools layer changed. 03 asked who can fix a failure at runtime; 04 asks the same question one step earlier. A plugin whose function body references a name that does not exist is deterministic and fixable by editing the file, so the agent refuses to start; a plugin that cannot be imported is an environment problem, so it degrades, is recorded in `FAILED`, and is printed by `main.py`. The payoff is a toolkit that can grow from three tools to twelve — and keep growing — without `react_agent.py` knowing that anything happened.
+
+### 05 Multi-Round ReAct Agent
+
+[05-multi-round-agent](05-multi-round-agent/) turns the one-shot agent into a conversation. The loop, the retry policy, the twelve tools and the plugin loader are unchanged — every file under `tools/` is byte-for-byte identical to 04's — and what changes is that the history is no longer thrown away between runs. `reset()` stops taking a prompt and runs only on the first turn, `run()` appends to the existing messages instead of rebuilding them, and the model's closing reply is written back into the history so the next turn can see what it already answered. `main.py` grows a second mode: with an argument it is 04, without one it is a REPL. Output becomes streaming — the chunks are re-assembled into the exact message shape the rest of the loop already expected — and rendered as markdown when stdout is a terminal.
+
+Here's the structure of a multi-round ReAct agent:
+
+```mermaid
+flowchart TD
+    U["User"] --> M{"argv?"}
+
+    M -- "prompt given" --> S["One-shot mode<br/>run(prompt), then exit — as in 04"]
+    M -- "no argument" --> REPL["Multi-turn REPL<br/>prompt [N] · exit / quit / Ctrl-D"]
+
+    S --> R["ReActAgent.run(prompt)"]
+    REPL --> R
+    REPL -. "Ctrl-C mid-turn" .-> RB["Roll back this turn<br/>del messages[start:]"]
+
+    R --> H{"first turn?"}
+    H -- "yes" --> RS["reset(): history = system prompt"]
+    H -- "no" --> AP["append to the history already there"]
+    RS --> L
+    AP --> L["Round loop — unchanged from 04"]
+
+    L --> ST["create(..., stream=True)"]
+    ST --> CS["_consume_stream<br/>print live · reassemble into msg"]
+
+    CS --> T{"Final Answer,<br/>or no tool calls?"}
+    T -- "no" --> EX["Execute the tools<br/>one tool result per call, in order"]
+    EX --> L
+    T -- "yes" --> AR["_append_assistant_reply<br/>the next turn must contain this"]
+    AR --> RD["Return — the conversation stays in memory"]
+```
+
+In pseudocode, the REPL's turn boundary and the re-assembly can be represented as follows:
+
+```python
+while True:                                        # main.py, when there is no argument
+    prompt = input(f"[{agent.turn + 1}] you > ")
+    if prompt in ("exit", "quit"):
+        break
+
+    snapshot = len(agent.messages)                 # a turn is atomic from the outside
+    try:
+        agent.run(prompt)
+    except KeyboardInterrupt:
+        del agent.messages[snapshot:]              # a half-written turn is a 400 waiting to happen
+```
+
+```python
+def run(self, prompt):
+    prompt = scrub_surrogates(prompt)              # terminal input can carry invalid UTF-8
+    if not self.messages:                          # first turn only — the whole multi-turn change
+        self.reset()                               # history = [system prompt]
+    self.messages.append({"role": "user", "content": prompt})
+
+    while round < max_rounds:
+        stream = create(self.messages, tools=TOOLS_DESC, stream=True)
+        msg = consume_stream(stream)               # printed as it arrives; shape is the old one
+
+        if "Final Answer:" in msg.content or not msg.tool_calls:
+            self._append_assistant_reply(msg, msg.content)   # keep it — the next turn needs it
+            return msg.content
+
+        execute_tools_and_append_one_result_each(msg)        # unchanged from 03
+```
+
+The core difference between the 04 and 05 agents is where the state lives. 04's agent was a function of one prompt: it built a history, ran it to an answer, and returned. 05's agent is a function of a conversation: the history *is* the agent, it outlives the call, and every turn appends to it. The rest follows from that — the reply has to be written back because the history must be complete at the end of a turn, the Ctrl-C rollback exists because it must also be complete at every point a keyboard can interrupt it, and a malformed history now costs the session rather than the run. The tools layer, which 04 spent its whole budget on, needed no changes at all — not even a comment.
