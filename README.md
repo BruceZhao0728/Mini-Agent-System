@@ -314,3 +314,53 @@ def compact(self):
 ```
 
 The core difference between the 05 and 06 agents is what the history is allowed to become. 05's history was append-only: the conversation *was* the record, and nothing could ever be taken out of it, which made a context-limit `400` unrecoverable inside a session. 06 keeps the history as the source of truth but makes it replaceable — a summary takes the place of everything older than the last few turns, and the messages that remain are still shaped exactly as the API requires. The rules 03–05 carried in comments became a validator, because compaction is the first operation that could break them silently; the number that decides *when* to compact comes from the server rather than from a second, disagreeing tokenizer; and nothing compacts automatically, because throwing away the record of a session is a decision for the person who knows what the session is for.
+
+### 07 Multi-Round ReAct Agent with Long-Term Memory
+
+[07-multi-round-agent-with-memory](07-multi-round-agent-with-memory/) gives the agent something that outlives the process. The loop, the retry policy, the thinking channel, the REPL and the whole compaction machinery are unchanged — seven of the eight files under `tools/` are still byte-for-byte identical to 06's — and what changes is that knowledge now has a place to live outside the conversation. `memory.py` (new, pure) is an append-only `memory/notes.jsonl` plus the index built from it; `tools/notes.py` (new) exposes `write_note`, `recall_notes` and `forget_note`; and `reset()` splices the index into `messages[0]`, so a fresh session starts knowing what earlier ones chose to keep — inside the one message compaction never touches. Retrieval is a tool the model decides to call, not a per-turn top-k injection, and writing is the model's decision too. The same lesson closes a gap 02–06 never noticed: `finish_reason` was parsed from every response and thrown away, so a reply the server cut short was reported as a finished answer; it is now captured, logged every round, and judged on closing replies. `main.py` grows a command line — `--root`, `--msg`, `--help` — and a fifth REPL command, `/memory`.
+
+Here's the structure of an agent with long-term memory:
+
+```mermaid
+flowchart TD
+    CLI["python3 main.py"] --> P{"argv"}
+    P -- "--help" --> H["usage — printed before the key check, no log file, no chdir"]
+    P -- "a prompt (--msg or bare)" --> S["one-shot: run(prompt), then exit"]
+    P -- "nothing, or --root alone" --> REPL["multi-turn REPL<br/>/compact · /context · /help · /memory · /exit"]
+    P -. "--root dir" .-> CD["os.chdir(dir)<br/>logs/, memory/ and every tool path follow"]
+
+    S --> R["ReActAgent.run(prompt)<br/>loop unchanged from 06"]
+    REPL --> R
+    CD -.-> R
+    R --> RS["reset() — first turn only<br/>messages[0] = system prompt + the memory index"]
+    RS --> IDX["render_index(): ≤ 40 notes / 4,000 chars<br/>newest kept, oldest fall out"]
+    IDX -. "rides in the system prompt from here on" .-> R
+
+    STORE[("memory/notes.jsonl")] -. "read at the start of the next process" .-> RS
+    R --> T{"the round's reply"}
+    T -- "tool calls" --> MEM["write_note · recall_notes · forget_note<br/>→ memory.py: append / search / forget"]
+    MEM --> STORE
+    MEM --> R
+    T -- "Final Answer / no tool calls" --> FR{"finish_reason + the reply's shape"}
+    FR -- "length, empty, or an unclosed Thought:" --> W["⚠ warning above [Final] / [Done]"]
+    FR -- "complete" --> D["[Final] / [Done] — as in 06"]
+```
+
+In pseudocode, the two halves of the memory — the write path and the session-start read — can be represented as follows:
+
+```python
+def write_note(summary, body="", type="project"):     # tools/notes.py → memory.append()
+    if summary in {n["summary"] for n in load(NOTES_PATH)}:
+        return "Already stored (not written again): " + summary
+    append({"id": next_id(), "ts": now(), "type": type, "summary": summary, "body": body})
+    return f"Stored note {id} ({type}): {summary}"
+```
+
+```python
+def reset(self):                                       # react_agent.py — first turn only
+    index = render_index(NOTES_PATH, max_notes=40, max_chars=4000)   # 40 lines is the fixed cost
+    self.messages = [{"role": "system",
+                      "content": self.system_prompt + MEMORY_INDEX_HEADER + index}]
+```
+
+The core difference between the 06 and 07 agents is where knowledge is allowed to live. 06's agent knew only its system prompt at startup, and everything it learned had to be discovered again inside the session that needed it — the conversation had become compressible, but it was still mortal. 07's agent begins each process by reading what earlier processes chose to keep, and the model is told both what the store holds (the index) and how to look deeper (`recall_notes`). The two budgets are kept apart on purpose: the index is prompt text and is paid for on every request, the bodies are tool results and are paid for only when a lookup is worth making. That is also why the store is refusal-first — writes idempotent on the summary, deletion taking an id and nothing else — and why the missing signal in 02–06 was worth fixing in the same lesson: an agent that persists what it learned should not report a truncated answer as a finished one.
