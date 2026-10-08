@@ -249,3 +249,68 @@ def run(self, prompt):
 ```
 
 The core difference between the 04 and 05 agents is where the state lives. 04's agent was a function of one prompt: it built a history, ran it to an answer, and returned. 05's agent is a function of a conversation: the history *is* the agent, it outlives the call, and every turn appends to it. The rest follows from that — the reply has to be written back because the history must be complete at the end of a turn, the Ctrl-C rollback exists because it must also be complete at every point a keyboard can interrupt it, and a malformed history now costs the session rather than the run. The tools layer, which 04 spent its whole budget on, needed no changes at all — not even a comment.
+
+### 06 Multi-Round ReAct Agent with Compaction
+
+[06-multi-round-agent-with-compact](06-multi-round-agent-with-compact/) makes the unbounded conversation compressible. The loop, the retry policy, the twelve tools and the plugin loader are unchanged — every file under `tools/` is byte-for-byte identical to 05's — and what changes is that the older part of the history can now be replaced by a summary. Context occupancy is read from the API's own `usage` report (no local tokenizer, no extra dependency) and shown after every turn, `/compact` summarizes everything but the last couple of turns, and the REPL grows `/context`, `/help` and `/exit` beside it. The compaction is a transaction: a candidate history is built, validated against the message-shape rules that 03–05 enforced only by convention, checked for actually being smaller, and swapped in on the last line — every failure path leaves the history untouched.
+
+Here's the structure of a compacting ReAct agent:
+
+```mermaid
+flowchart TD
+    U["User"] --> REPL["Multi-turn REPL<br/>prompt · /compact · /context · /help · /exit"]
+
+    REPL --> R["ReActAgent.run(prompt)<br/>loop unchanged from 05"]
+    R --> API["create(..., stream=True,<br/>stream_options={include_usage: true})"]
+    API --> US["the API's own usage report<br/>→ last_usage"]
+    US --> CL["context line after every turn"]
+    CL -- "≥ 70% / ≥ 85% of the budget" --> W["⚠️ / 🔴 — suggests /compact"]
+    W --> REPL
+
+    REPL -- "/compact" --> C["compact()<br/>build first, swap last"]
+    C --> S1["split_history<br/>cut only at a turn or group boundary"]
+    S1 -- "no legal, useful cut" --> RJ["refuse — history untouched, logged"]
+    S1 --> S2["render_transcript → _summarize<br/>non-streaming · no tools · thinking off"]
+    S2 --> S3["build_compacted<br/>summary merged into the next user message"]
+    S3 --> S4{"validate_history legal?<br/>smaller than it was?"}
+    S4 -- "no" --> RJ
+    S4 -- "yes" --> SW["self.messages = candidate<br/>last_usage = None"]
+    SW --> R
+```
+
+In pseudocode, the two new pieces can be represented as follows:
+
+```python
+while True:                                    # main.py — the REPL, now with commands
+    prompt = input(f"[{agent.turn + 1}] you > ")
+    if prompt.split()[0] in COMMANDS:          # dispatched *before* the rollback snapshot:
+        handle_command(agent, prompt)          #   /compact rewrites the list the snapshot indexes into
+        continue
+
+    start = len(agent.messages)                # a turn is still atomic from the outside
+    try:
+        agent.run(prompt)                      # unchanged from 05, plus the usage report
+    except KeyboardInterrupt:
+        del agent.messages[start:]
+    show_context(agent)                        # the number the /compact decision is made on
+```
+
+```python
+def compact(self):
+    cut = split_history(self.messages)                     # turn boundaries, else group boundaries
+    if cut is None:
+        return False, "nothing to compact"                 # too short — the recent turns are protected
+
+    summary = self._summarize(render_transcript(self.messages[1:cut]))
+    candidate = build_compacted(self.messages, cut, summary)   # summary rides inside the next user message
+
+    if not summary or validate_history(candidate):          # structural rules, checked not assumed
+        return False, "refused — history untouched"
+    if message_chars(candidate) >= message_chars(self.messages):
+        return False, "refused — the summary is not smaller"
+
+    self.messages = candidate                               # build first, swap last
+    self.last_usage = None                                  # that measurement described the old history
+```
+
+The core difference between the 05 and 06 agents is what the history is allowed to become. 05's history was append-only: the conversation *was* the record, and nothing could ever be taken out of it, which made a context-limit `400` unrecoverable inside a session. 06 keeps the history as the source of truth but makes it replaceable — a summary takes the place of everything older than the last few turns, and the messages that remain are still shaped exactly as the API requires. The rules 03–05 carried in comments became a validator, because compaction is the first operation that could break them silently; the number that decides *when* to compact comes from the server rather than from a second, disagreeing tokenizer; and nothing compacts automatically, because throwing away the record of a session is a decision for the person who knows what the session is for.
