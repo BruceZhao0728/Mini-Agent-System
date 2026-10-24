@@ -364,3 +364,73 @@ def reset(self):                                       # react_agent.py — firs
 ```
 
 The core difference between the 06 and 07 agents is where knowledge is allowed to live. 06's agent knew only its system prompt at startup, and everything it learned had to be discovered again inside the session that needed it — the conversation had become compressible, but it was still mortal. 07's agent begins each process by reading what earlier processes chose to keep, and the model is told both what the store holds (the index) and how to look deeper (`recall_notes`). The two budgets are kept apart on purpose: the index is prompt text and is paid for on every request, the bodies are tool results and are paid for only when a lookup is worth making. That is also why the store is refusal-first — writes idempotent on the summary, deletion taking an id and nothing else — and why the missing signal in 02–06 was worth fixing in the same lesson: an agent that persists what it learned should not report a truncated answer as a finished one.
+
+### 08 Planning Agent
+
+[08-planning-agent](08-planning-agent/) puts an explicit plan in front of each request. The ReAct executor, the retry policy, compaction, long-term memory and the fifteen tools are unchanged — four of the eight files under `tools/` are still byte-for-byte identical to 07's, and the other four changed only in comments and docstrings — and what changes is that a task's outline now exists as program state. Every request begins with one streamed Planner call — no tools, thinking on, a cap of `PLAN_MAX_TOKENS` — returning a JSON object with `needs_plan` and an ordered `steps` list. The reply is checked as a boolean plus a list of non-empty steps: a simple request returns `needs_plan=false`, a planned task must have 2–8 steps, and invalid JSON, a shape violation or a Planner exception falls back to 07's ReAct path. A valid plan is kept in `self.plan`, runs step by step through the same `_run_react`, and every step carries the original task plus the results already completed. The steps share the request's one `MAX_ROUNDS` budget, their status moves through `pending`, `in_progress`, `completed` and `failed`, and a terminal executor failure marks the step failed and stops the rest. The plan is refreshed into `messages[0]` whenever it changes, inside the message compaction's `keep_head=1` protects; it is task state, not a note, so it is never written to `memory/notes.jsonl`. On a TTY a fixed-bottom footer shows the plan while it runs, and Ctrl-C restores the plan along with the history. The lesson also reorganises the code: the single agent module becomes `agent/` (state plus planning, orchestration, loop, request, execution and compaction mixins), compaction and rendering move into `context/` and `presentation/`, and `_test.py` becomes a `tests/` package with a planning group — still offline.
+
+Here's the structure of a planning agent:
+
+```mermaid
+flowchart TD
+    U["User request"] --> P["Planner call<br/>streamed · no tools · JSON only"]
+    P --> V{"needs_plan, and 2–8<br/>non-empty steps?"}
+    V -- "no / invalid JSON / Planner error" --> R["ReAct executor<br/>unchanged from 07"]
+
+    V -- "yes" --> S["self.plan = steps<br/>status: pending"]
+    S --> SY["refresh messages[0]<br/>system prompt + memory index + plan"]
+    SY --> I["mark the next step in_progress<br/>redraw the footer"]
+    I --> E["_run_react(step prompt)<br/>original task + completed results"]
+    E --> F{"terminal failure?<br/>exception · Max steps · LLM error"}
+    F -- "yes" --> X["mark failed<br/>stop the remaining steps"]
+    F -- "no" --> C["mark completed"]
+    C --> M{"more steps?"}
+    M -- "yes" --> I
+    M -- "no" --> A["return the last step's answer"]
+    X --> A2["return the stopped-plan message"]
+    SY -. "compaction keeps messages[0]" .-> K["/compact — unchanged from 07"]
+```
+
+In pseudocode, the Planner's validation and the ordered execution can be represented as follows:
+
+```python
+def _parse_plan_response(content):                      # agent/helpers.py — pure, testable offline
+    data = json.loads(content)                          # one JSON object, no fences
+    if not isinstance(data.get("needs_plan"), bool):
+        return False, [], "needs_plan must be a boolean"
+    steps = data.get("steps")
+    if not isinstance(steps, list) or any(not isinstance(s, str) or not s.strip() for s in steps):
+        return False, [], "steps must be non-empty strings"
+    steps = [s.strip() for s in steps]
+    if not data["needs_plan"]:
+        return False, [], ""                            # simple request — no plan
+    if not 2 <= len(steps) <= PLAN_MAX_STEPS:           # 2..8, PLAN_MAX_STEPS = 8
+        return False, [], "plan rejected"
+    return True, steps, ""
+```
+
+```python
+def run(self, prompt):                                  # agent/orchestration.py
+    if not self.messages:                               # first turn only
+        self.reset()                                    # system prompt + memory index
+    self.plan = []
+
+    needs_plan, steps, error = self._request_plan(prompt)   # one streamed call, no tools
+    if error or not needs_plan:                         # simple / invalid / Planner failure
+        return self._run_react(prompt)                  # unchanged from 07
+
+    self.plan = [{"text": s, "status": "pending"} for s in steps]
+    self._refresh_plan_context()                        # writes into messages[0]
+
+    for i, step in enumerate(self.plan):
+        step["status"] = "in_progress"
+        self._refresh_plan_context()                    # the plan is also prompt text
+        result = self._run_react(step_prompt(prompt, self.plan, i))   # same ReAct loop
+        if self._execution_failed(result):              # exception, Max steps, LLM error
+            step["status"] = "failed"
+            return f"Plan stopped at step {i + 1}/{len(self.plan)}: {result}"
+        step["status"] = "completed"
+    return result
+```
+
+The core difference between the 07 and 08 agents is whether the task has an outline apart from the conversation. 07's agent chose every next action from the history as it went: flexible, but the only record of the whole task was the conversation itself, and compaction could summarize that record away. 08's plan is small, disposable program state — for this request only, not a tool result and not a lasting note — so order and progress exist outside the transcript and are refreshed into `messages[0]`, the one message compaction never touches. The executor stays ReAct because each step still has to react to what its tools return; the Planner only decides the order. The price is one extra model call per request, a plan the model can get wrong, and a round budget early steps can exhaust — accepted because the alternative is the thing 07 already did: no separate record of intent at all.
