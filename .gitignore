@@ -2,5 +2,13 @@
 .claude/
 CLAUDE.md
 
+# Codex and ChatGPT related files
+.codex/
+.agents/
+.chatgpt/
+AGENTS.md
+CODEX.md
+CHATGPT.md
+
 # VSCode related files
 .vscode/
