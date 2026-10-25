@@ -434,3 +434,68 @@ def run(self, prompt):                                  # agent/orchestration.py
 ```
 
 The core difference between the 07 and 08 agents is whether the task has an outline apart from the conversation. 07's agent chose every next action from the history as it went: flexible, but the only record of the whole task was the conversation itself, and compaction could summarize that record away. 08's plan is small, disposable program state — for this request only, not a tool result and not a lasting note — so order and progress exist outside the transcript and are refreshed into `messages[0]`, the one message compaction never touches. The executor stays ReAct because each step still has to react to what its tools return; the Planner only decides the order. The price is one extra model call per request, a plan the model can get wrong, and a round budget early steps can exhaust — accepted because the alternative is the thing 07 already did: no separate record of intent at all.
+
+### 09 Parallel Tool Execution
+
+[09-parallel-tool-execution](09-parallel-tool-execution/) lets one round's tool calls overlap. The Planner, the ordered plan steps, the ReAct loop, compaction, long-term memory and the same fifteen tools are unchanged — 29 of the 42 files the two lessons share are byte-identical, and seven of the eight tool files changed: four only add a `parallel_safe` marker, and three carry the metadata plumbing and the 429 fix — and what changes is the executor between one assistant message and its tool results. 08 ran a round's calls one after another on the caller's thread, so a batch of reads cost the sum of their times. 09 replaces that loop with three phases. Phase 1 runs on the caller thread and does everything that must stay deterministic: the per-round cap, JSON parsing, the arguments-size log, the `Action` print and the classification. Phase 2 splits the admitted calls into contiguous groups — a run of `parallel_safe` calls becomes one group, while every unsafe, unparseable or over-cap call is a one-element barrier — and runs the groups in order: a one-element safe run runs inline, an unsafe call runs serially on the caller thread, a rejected call is never executed, and a longer safe run gets a fresh `ThreadPoolExecutor` with `max(1, min(PARALLEL_MAX_WORKERS, len(group)))` workers. Phase 3 runs on the caller thread again and writes the results back in the original `tool_calls` order: `str()` → `raw_len` → `clip()` → log → print → one tool message per call — and `react_loop.py` extends the history with those tool messages only after the scheduler returns. The policy lives with the tools: `@tool(..., parallel_safe=False)` is the default, nine tools opt in (`read_file`, `list_directory`, `search_web`, `fetch_webpage`, `get_news`, `git_status`, `git_diff`, `git_log`, `recall_notes`) and six do not (`write_file`, `execute_command`, `download_file`, `run_python`, `write_note`, `forget_note`). The metadata is projected into `TOOL_META`, validated as a bool at load time and never sent to the model — `TOOLS_DESC` is still the 08 schema. `PARALLEL_ENABLED=0` restores the serial shape with an identical list of tool messages; `PARALLEL_MAX_WORKERS` is a constant (4), not an environment variable. The lesson also drags in a 429 → `ConnectionError` fix so rate limits are retried, `GIT_OPTIONAL_LOCKS=0` for the read-only git tools, a `_LOG_LOCK` and a `tool_call_id` in the retry log because workers now share one file, and `[i/N]` labels on multi-call Action/Observation output. `tests/test_parallel.py` pins the safe set, real overlap, barriers, failure containment and ordering without an API call.
+
+Here's the structure of an agent with parallel tool execution:
+
+```mermaid
+flowchart TD
+    A["assistant message<br/>N tool_calls, in order"] --> P1["Phase 1 — caller thread<br/>cap · JSON parse · Action print<br/>safe = TOOL_META[name] is True"]
+    P1 --> G["contiguous groups, in order<br/>safe runs · one-call barriers"]
+    G --> Q{"next group<br/>longer than one?"}
+    Q -- "no" --> I["caller thread<br/>inline safe · serial unsafe · rejected"]
+    Q -- "yes" --> W["new ThreadPoolExecutor<br/>min(4, len(group)) workers"]
+    W --> F["submit in order<br/>future.result() in order"]
+    F --> OK["shutdown(wait=True)"]
+    F -. "Ctrl-C while waiting" .-> X["cancel queued · raise<br/>main rolls the turn back"]
+    I --> P3["Phase 3 — original order<br/>str → raw_len → clip → log/print"]
+    OK --> P3
+    P3 --> M["one tool message per call<br/>messages.extend(...) after success"]
+```
+
+In pseudocode, the scheduler and its safety boundary can be represented as follows:
+
+```python
+def _execute_tool_calls(self, tool_calls, parallel=None):        # agent/execution.py
+    parallel = PARALLEL_ENABLED if parallel is None else parallel
+    plans = admit(tool_calls, parallel)   # cap · parse JSON · log size · Action · classify
+    outcomes = {}
+    for group in contiguous_groups(plans):    # safe runs; every other call is a barrier
+        if len(group) == 1:
+            outcomes[group[0]["i"]] = self._run_inline(group[0])
+            continue
+        workers = max(1, min(int(PARALLEL_MAX_WORKERS), len(group)))
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [(p["i"], executor.submit(self._run_worker, p)) for p in group]
+            for i, future in futures:
+                outcomes[i] = future.result()      # submission order, not as_completed
+        except BaseException:                      # Ctrl-C while waiting
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+    return write_back(plans, outcomes)             # original order; one message per call
+```
+
+```python
+def _parallel_safe(self, name):                    # metadata is the only source
+    return TOOL_META.get(name, {}).get("parallel_safe") is True   # unknown → False
+
+def _run_worker(self, plan):                       # pool thread: nothing escapes
+    started = time.monotonic()
+    try:
+        observation = self._call_tool(plan["name"], plan["args"],
+                                      tool_call_id=plan["tc"].id)
+    except BaseException as e:                     # SystemExit becomes an observation
+        observation = f"Error: {plan['name']} failed due to {type(e).__name__}: {e}"
+    return observation, time.monotonic() - started
+
+# agent/react_loop.py — the serial block is gone; the history grows only after success
+self.messages.extend(self._execute_tool_calls(msg.tool_calls))
+```
+
+The core difference between the 08 and 09 agents is whether a round has one lane. 08 chose which tools to call and then called them in the order the model wrote them, because that order was also the protocol: the API requires one tool message per `tool_calls` entry, in position. 09 keeps that protocol order exactly and separates it from execution order — the results still come back in the model's order, and only the work inside a contiguous safe run overlaps. That is why the scheduler is conservative in every direction: opt-in metadata that defaults to unsafe, a barrier at every unknown or unparseable call, a fresh pool per run rather than one shared pool, and results collected by submission index rather than by completion. The gain is wall time on batches the model already writes; the price is that the gain exists only when it batches, that a Python thread cannot be killed once a tool is running, and that a wrong `parallel_safe=True` stops being a performance bug and becomes a data race. 08 could be wrong about a plan; 09 can be wrong about a tool's safety, which is why the policy is a declaration in code and a test pins the exact set.
