@@ -12,3 +12,7 @@ CHATGPT.md
 
 # VSCode related files
 .vscode/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
