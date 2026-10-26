@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "id": "tool-raises",
+  "suite": "failure",
+  "prompt": "Call a tool that fails.",
+  "plan": {
+    "needs_plan": false,
+    "steps": []
+  },
+  "script": [
+    {
+      "type": "tool_call",
+      "name": "probe_boom",
+      "arguments": {},
+      "id": "call_boom"
+    },
+    {
+      "type": "final",
+      "content": "Final Answer: caught"
+    }
+  ],
+  "tools": {
+    "probe_boom": {
+      "error": "boom",
+      "parallel_safe": false
+    }
+  },
+  "limits": {
+    "max_rounds": 3
+  },
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [
+      "probe_boom"
+    ],
+    "tool_results_contain": [
+      "boom"
+    ],
+    "final_contains": [
+      "caught"
+    ],
+    "max_rounds": 2,
+    "max_model_requests": 3
+  }
+}

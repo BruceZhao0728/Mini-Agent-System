@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "plan-two-steps",
+  "suite": "smoke",
+  "prompt": "Do two steps.",
+  "plan": {
+    "needs_plan": true,
+    "steps": [
+      "step one",
+      "step two"
+    ]
+  },
+  "script": [
+    {
+      "type": "final",
+      "content": "Final Answer: done one"
+    },
+    {
+      "type": "final",
+      "content": "Final Answer: done two"
+    }
+  ],
+  "limits": {
+    "max_rounds": 3
+  },
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [],
+    "final_contains": [
+      "done two"
+    ],
+    "max_rounds": 2,
+    "max_model_requests": 3,
+    "trace_event_counts": {
+      "plan_step": 4
+    },
+    "request": {
+      "planner_called": true,
+      "system_prompt_contains": [
+        "Final Answer:"
+      ]
+    }
+  }
+}

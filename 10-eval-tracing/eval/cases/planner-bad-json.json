@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "planner-bad-json",
+  "suite": "failure",
+  "prompt": "Do something; the planner will fail.",
+  "plan": {
+    "raw": "not json"
+  },
+  "script": [
+    {
+      "type": "final",
+      "content": "Final Answer: fallback"
+    }
+  ],
+  "limits": {
+    "max_rounds": 2
+  },
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [],
+    "final_contains": [
+      "fallback"
+    ],
+    "max_rounds": 1,
+    "max_model_requests": 2,
+    "request": {
+      "planner_called": true
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "max-rounds",
+  "suite": "failure",
+  "prompt": "Keep calling tools.",
+  "plan": {
+    "needs_plan": false,
+    "steps": []
+  },
+  "script": [
+    {
+      "type": "tool_call",
+      "name": "read_file",
+      "arguments": {
+        "path": "a.txt"
+      },
+      "id": "call_loop"
+    }
+  ],
+  "tools": {
+    "read_file": {
+      "result": "x",
+      "parallel_safe": true
+    }
+  },
+  "limits": {
+    "max_rounds": 1
+  },
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [
+      "read_file"
+    ],
+    "final_equals": "Max steps reached",
+    "max_rounds": 1,
+    "max_model_requests": 2,
+    "trace_event_counts": {
+      "error": 1
+    }
+  }
+}

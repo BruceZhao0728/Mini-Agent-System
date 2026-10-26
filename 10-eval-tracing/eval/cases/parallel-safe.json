@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "id": "parallel-safe",
+  "suite": "smoke",
+  "prompt": "Run both probes.",
+  "plan": {
+    "needs_plan": false,
+    "steps": []
+  },
+  "shared_barrier": {
+    "parties": 2,
+    "timeout": 2
+  },
+  "script": [
+    {
+      "type": "tool_calls",
+      "calls": [
+        {
+          "name": "probe_a",
+          "arguments": {},
+          "id": "pa"
+        },
+        {
+          "name": "probe_b",
+          "arguments": {},
+          "id": "pb"
+        }
+      ]
+    },
+    {
+      "type": "final",
+      "content": "Final Answer: ok"
+    }
+  ],
+  "tools": {
+    "probe_a": {
+      "mode": "shared_barrier",
+      "result": "ok",
+      "parallel_safe": true
+    },
+    "probe_b": {
+      "mode": "shared_barrier",
+      "result": "ok",
+      "parallel_safe": true
+    }
+  },
+  "limits": {
+    "max_rounds": 3
+  },
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [
+      "probe_a",
+      "probe_b"
+    ],
+    "tool_call_count": 2,
+    "no_tool_errors": true,
+    "final_contains": [
+      "ok"
+    ],
+    "max_rounds": 2,
+    "max_model_requests": 3
+  }
+}

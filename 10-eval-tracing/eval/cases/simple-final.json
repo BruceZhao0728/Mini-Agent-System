@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "simple-final",
+  "suite": "smoke",
+  "prompt": "What is 2 + 2?",
+  "plan": {
+    "needs_plan": false,
+    "steps": []
+  },
+  "script": [
+    {
+      "type": "final",
+      "content": "Final Answer: 4"
+    }
+  ],
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [],
+    "final_contains": [
+      "4"
+    ],
+    "max_rounds": 1,
+    "max_model_requests": 2,
+    "max_total_tokens": 100,
+    "request": {
+      "planner_called": true,
+      "system_prompt_contains": [
+        "Final Answer:"
+      ],
+      "tool_schema_names": [
+        "read_file"
+      ]
+    }
+  }
+}

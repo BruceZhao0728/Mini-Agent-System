@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "schema-contract",
+  "suite": "smoke",
+  "prompt": "Check the request contract.",
+  "plan": {
+    "needs_plan": false,
+    "steps": []
+  },
+  "script": [
+    {
+      "type": "final",
+      "content": "Final Answer: contract ok"
+    }
+  ],
+  "expect": {
+    "history_valid": true,
+    "tool_sequence": [],
+    "final_contains": [
+      "contract ok"
+    ],
+    "max_rounds": 1,
+    "max_model_requests": 2,
+    "request": {
+      "planner_called": true,
+      "system_prompt_contains": [
+        "Final Answer:"
+      ],
+      "tool_schema_names": [
+        "read_file",
+        "write_file"
+      ]
+    }
+  }
+}
