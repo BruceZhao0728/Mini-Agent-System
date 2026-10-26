@@ -499,3 +499,71 @@ self.messages.extend(self._execute_tool_calls(msg.tool_calls))
 ```
 
 The core difference between the 08 and 09 agents is whether a round has one lane. 08 chose which tools to call and then called them in the order the model wrote them, because that order was also the protocol: the API requires one tool message per `tool_calls` entry, in position. 09 keeps that protocol order exactly and separates it from execution order — the results still come back in the model's order, and only the work inside a contiguous safe run overlaps. That is why the scheduler is conservative in every direction: opt-in metadata that defaults to unsafe, a barrier at every unknown or unparseable call, a fresh pool per run rather than one shared pool, and results collected by submission index rather than by completion. The gain is wall time on batches the model already writes; the price is that the gain exists only when it batches, that a Python thread cannot be killed once a tool is running, and that a wrong `parallel_safe=True` stops being a performance bug and becomes a data race. 08 could be wrong about a plan; 09 can be wrong about a tool's safety, which is why the policy is a declaration in code and a test pins the exact set.
+
+### 10 Eval and Tracing
+
+[10-eval-tracing](10-eval-tracing/) adds a machine-readable record around the loop and an offline harness that drives the loop. The Planner, the ordered plan steps, the ReAct loop, compaction, long-term memory, parallel tool execution and the same fifteen tools are unchanged — 35 of the 45 files the two lessons share (excluding the README) are byte-identical, and every tool, context, presentation and memory file is untouched — and what changes is the evidence. `tracing.py` (new, standard library only) writes one JSON object per event to `logs/trace_<timestamp>_<pid>.jsonl` when `MINI_AGENT_TRACE=1`: `turn`, `plan_step`, `round`, `model_request`, `tool_call`, `tool_result`, `verification` and `error`, each carrying `v`, `ts`, `trace_id`, `span_id`, `parent_span_id`, `event` and `actor`. The 24 emission points sit on the caller thread — `tool_call` in Phase 1b and `tool_result` in Phase 3, never inside a worker — so the trace preserves the model's order even when parallel calls finish out of order; the writer redacts credential-shaped keys and clips fields, rotates at 10 MiB keeping three files, writes mode `0600`, and disables itself rather than raise. `eval/` (new) runs JSON cases through the real `run()` with a scripted `FakeClient` that routes planner, executor and summarizer requests, then asserts six layers: history structure, trajectory, request contract, result, cost and trace invariants. `eval/runner.py` exits 0 on all pass, 1 on a case failure and 2 on a harness error; `eval/trace.py` validates parent links, tool-call pairing and secret leaks, and `eval/recordings.py` records responses and replays them by request hash, so a prompt or schema change invalidates the recording instead of silently passing. Ten offline cases cover the smoke and failure suites, and `tests/test_tracing.py` plus `tests/test_eval_harness.py` pin the tracer and the harness without a network call. There is no new `main.py` flag or REPL command; `--help` gains two trace lines, and `config.py` adds `MINI_AGENT_LOG`, the `TRACE_*` block and budget overrides for the harness.
+
+Here's the structure of an agent with eval and tracing:
+
+```mermaid
+flowchart TD
+    U["User request"] --> R["ReAct agent<br/>unchanged from 09"]
+    R --> T["tracing.py<br/>turn · plan_step · round · model_request<br/>tool_call · tool_result · verification · error"]
+    T --> J[("logs/trace_<timestamp>_<pid>.jsonl")]
+    R --> A["final answer"]
+    E["eval/runner.py --suite smoke"] --> F["FakeClient<br/>scripted responses"]
+    F --> R
+    E --> AS["assertions<br/>structure · trajectory · request contract<br/>result · cost · trace"]
+    J -. "read_trace" .-> AS
+    J -. "offline CLI" .-> V["eval/trace.py --check --summary"]
+```
+
+In pseudocode, trace emission and one eval case can be represented as follows:
+
+```python
+def emit(self, event, *, actor, span_id=None, parent_span_id=None, **fields):   # tracing.py
+    if not self.enabled:
+        return None
+    try:
+        record = {"v": 1, "ts": _utc_now(), "trace_id": self.trace_id,
+                  "span_id": span_id or self.new_span(),
+                  "parent_span_id": parent_span_id,
+                  "event": event, "actor": actor}
+        record.update(_clean_value(fields, self.max_field_chars,
+                                   self.include_content))
+        data = (json.dumps(record, ensure_ascii=False,
+                           separators=(",", ":")) + "\n").encode("utf-8")
+        with self._lock:
+            self._rotate(len(data))
+            fd = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+            finally:
+                os.close(fd)
+    except Exception:
+        self.enabled = False          # tracing must never break the agent
+```
+
+```python
+def run_case(case, trace_dir, record=False, replay=False):      # eval/runner.py
+    for name, spec in (case.get("tools") or {}).items():
+        TOOLS[name] = make_tool(name, spec, shared_barrier)
+        TOOL_META[name] = {"parallel_safe": bool(spec.get("parallel_safe", False))}
+    client = (ReplayClient(path) if replay else
+              RecordClient(inner, path, case["id"]) if record else FakeClient(case))
+    tracer = Tracer(os.path.join(trace_dir, f"{case['id']}.jsonl"))
+    agent = ReActAgent(client=client, tracer=tracer)
+    try:
+        result = agent.run(case["prompt"])       # the real loop, not a copy
+        events = read_trace(trace_path)
+        failures = check_case(agent, case, result, client.requests, events)
+        return CaseResult(case["id"], passed=not failures, failures=failures)
+    finally:
+        restore(TOOLS, TOOL_META)                # and the four patched budgets
+```
+
+The core difference between the 09 and 10 agents is what evidence the loop leaves behind. 09 optimized execution but kept one human-readable log and a set of function-level assertions: enough to know a tool overlapped, not enough to reconstruct a request or re-run a scenario. 10 adds a second, machine-readable record and a harness that drives the real loop with a scripted model, so a failure can be inspected as a span tree, replayed offline, and checked against the request contract without credentials. The trace is optional and fail-safe, the harness is never a production dependency, and neither changes the model-facing protocol. What the harness proves is the loop, the tools, the history shape, the request contract and the trace — not the model's judgment.
